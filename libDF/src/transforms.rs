@@ -1,7 +1,7 @@
-use std::mem::MaybeUninit;
-
+use audioadapter_buffers::direct::SequentialSlice;
 use ndarray::{prelude::*, Slice};
-use rubato::{FftFixedInOut, Resampler};
+use rubato::audioadapter::Adapter;
+use rubato::{Fft, FixedSync, Resampler};
 use thiserror::Error;
 
 use crate::*;
@@ -308,7 +308,7 @@ pub fn erb_norm(
     let mut state = state.unwrap_or_else(|| {
         let b = input.len_of(Axis(2));
         let state_ch0 = Array1::<f32>::linspace(MEAN_NORM_INIT[0], MEAN_NORM_INIT[1], b)
-            .into_shape([1, b])
+            .into_shape_with_order([1, b])
             .unwrap();
         let mut state = state_ch0.clone();
         for _ in 1..input.len_of(Axis(0)) {
@@ -339,7 +339,7 @@ pub fn unit_norm(
     let mut state = state.unwrap_or_else(|| {
         let f = input.len_of(Axis(2));
         let state_ch0 = Array1::<f32>::linspace(UNIT_NORM_INIT[0], UNIT_NORM_INIT[1], f)
-            .into_shape([1, f])
+            .into_shape_with_order([1, f])
             .unwrap();
         let mut state = state_ch0.clone();
         for _ in 1..input.len_of(Axis(0)) {
@@ -372,7 +372,9 @@ pub(crate) fn low_pass_resample(
     x.slice_axis_inplace(Axis(1), Slice::from(0..orig_len));
     Ok(x)
 }
-/// Resample using a synchronous resample from rubato
+/// Resample using a synchronous FFT resampler from rubato.
+///
+/// The output has `ceil(len * new_sr / sr)` frames and the resampler delay is compensated.
 pub fn resample(
     x: ArrayView2<f32>,
     sr: usize,
@@ -381,58 +383,25 @@ pub fn resample(
 ) -> Result<Array2<f32>> {
     let channels = x.len_of(Axis(0));
     let len = x.len_of(Axis(1));
-    let out_len = (len as f32 * new_sr as f32 / sr as f32).ceil() as usize;
     let chunk_size = chunk_size.unwrap_or(2048);
-    let mut resampler = FftFixedInOut::<f32>::new(sr, new_sr, chunk_size, channels)
+    let mut resampler = Fft::<f32>::new(sr, new_sr, chunk_size, channels, FixedSync::Both)
         .expect("Could not initialize resampler");
-    let chunk_size = resampler.input_frames_max();
-    // One extra to get the remaining resampler state buffer
-    let num_chunks = (len as f32 / chunk_size as f32).ceil() as usize + 1;
-    let chunk_size_out = resampler.output_frames_max();
-    let mut out = Array2::uninit((channels, chunk_size_out * num_chunks));
-    let mut inbuf = resampler.input_buffer_allocate(true);
-    let mut outbuf = resampler.output_buffer_allocate(true);
-    let mut out_chunk_iter = out.axis_chunks_iter_mut(Axis(1), chunk_size_out);
-    for chunk in x.axis_chunks_iter(Axis(1), chunk_size) {
-        for (chunk_ch, buf_ch) in chunk.axis_iter(Axis(0)).zip(inbuf.iter_mut()) {
-            if chunk_ch.len() == chunk_size {
-                chunk_ch.assign_to(buf_ch);
-            } else {
-                chunk_ch.assign_to(&mut buf_ch[..chunk_ch.len()]);
-                for b in buf_ch[chunk_ch.len()..].iter_mut() {
-                    *b = 0. // Zero pad
-                }
-            }
-        }
-        resampler.process_into_buffer(&inbuf, &mut outbuf, None)?;
-        for (res_ch, mut out_ch) in
-            outbuf.iter().zip(out_chunk_iter.next().unwrap().axis_iter_mut(Axis(0)))
-        {
-            debug_assert_eq!(res_ch.len(), out_ch.len());
-            for (&x, y) in res_ch.iter().zip(out_ch.iter_mut()) {
-                *y = MaybeUninit::new(x);
-            }
-        }
+    let input = x.as_standard_layout();
+    let input = SequentialSlice::new(input.as_slice().unwrap(), channels, len)
+        .expect("input buffer matches its shape");
+    let output = resampler.process_all(&input, len, None)?;
+    // Exact `ceil(len * new_sr / sr)`; rubato's float ratio can round one frame up.
+    let out_len = (len * new_sr).div_ceil(sr);
+    let produced = output.frames();
+    // `process_all` returns interleaved frames; convert to [channels, frames].
+    let mut out = Array2::from_shape_vec((produced, channels), output.take_data())?
+        .reversed_axes()
+        .as_standard_layout()
+        .into_owned();
+    if produced > out_len {
+        out.slice_axis_inplace(Axis(1), Slice::from(0..out_len));
     }
-    // Another round with zeros to get remaining state buffer
-    for in_ch in inbuf.iter_mut() {
-        in_ch.fill(0.)
-    }
-    resampler.process_into_buffer(&inbuf, &mut outbuf, None)?;
-    for (res_ch, mut out_ch) in
-        outbuf.iter().zip(out_chunk_iter.next().unwrap().axis_iter_mut(Axis(0)))
-    {
-        debug_assert_eq!(res_ch.len(), out_ch.len());
-        for (&x, y) in res_ch.iter().zip(out_ch.iter_mut()) {
-            *y = MaybeUninit::new(x);
-        }
-    }
-    let mut out = unsafe { out.assume_init() };
-    out.slice_axis_inplace(
-        Axis(1),
-        Slice::from(chunk_size_out / 2..chunk_size_out / 2 + out_len),
-    );
-    Ok(out)
+    Ok(out.as_standard_layout().into_owned())
 }
 
 /// Bandwidth extension via spectral translation.
@@ -502,7 +471,7 @@ fn bw_filterbank(center_freqs: &[f32], cutoff_bins: &[f32; 8]) -> Result<Array2<
             o[7] += 1.
         }
     }
-    let sum = out.sum_axis(Axis(0)).into_shape((1, 8))?;
+    let sum = out.sum_axis(Axis(0)).into_shape_with_order((1, 8))?;
     Ok(out / sum)
 }
 
