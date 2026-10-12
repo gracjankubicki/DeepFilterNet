@@ -4,11 +4,13 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "kaldi-native-fbank>=1.22.3",
+    "loguru>=0.7.3",
     "numpy>=2.5.3",
     "onnxruntime>=1.30.0",
     "scipy>=1.18.1",
     "soundfile>=0.14.0",
     "torch>=2.14.1",
+    "typing-extensions>=4.16.0",
 ]
 
 [tool.pytest.ini_options]
