@@ -54,3 +54,11 @@ def test_spectral_loss_is_finite_on_silence_and_zero_when_equal():
     assert torch.isfinite(value) and torch.isfinite(silent.grad).all()
     x = torch.randn(1, 9600)
     assert loss(x, x).item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_under_weight_only_penalises_removed_target_more():
+    torch.manual_seed(1)
+    t = torch.randn(1, 9600)
+    plain, under = MultiResSpecLoss(), MultiResSpecLoss(under=2.0)
+    assert under(t * 0.5, t) > plain(t * 0.5, t) * 1.5
+    assert under(t * 1.5, t).item() == pytest.approx(plain(t * 1.5, t).item(), rel=1e-6)

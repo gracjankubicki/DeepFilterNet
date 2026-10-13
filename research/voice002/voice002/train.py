@@ -39,6 +39,9 @@ N_SEG = int(SEG_S * SR)
 ENROLL_S = 10.0
 N_ENROLL = 3
 MIN_CV_CLIPS = 8
+# Target loss of plain DFN3 on ls-dev (step 0 of every run); the budget when starting from
+# a fine-tuned checkpoint (--init), whose own step 0 is no longer DFN3.
+DFN3_DEV_LOSS_DB = 0.482
 
 
 def _rank(p: Path) -> str:
@@ -179,9 +182,11 @@ class Mixtures(IterableDataset):
 class MultiResSpecLoss(torch.nn.Module):
     """DFN3's multi-resolution loss: compressed magnitude + compressed complex, gamma 0.3."""
 
-    def __init__(self, ffts=(256, 512, 1024, 2048), gamma=0.3, factor=500.0):
+    def __init__(self, ffts=(256, 512, 1024, 2048), gamma=0.3, factor=500.0, under=1.0):
         super().__init__()
-        self.ffts, self.gamma, self.factor = ffts, gamma, factor
+        # under > 1 weighs bins where the output is quieter than the target (target speech
+        # removed) more than bins where it is louder (residual), like DFN's factor_under.
+        self.ffts, self.gamma, self.factor, self.under = ffts, gamma, factor, under
         for n in ffts:
             self.register_buffer(f"win{n}", torch.hann_window(n))
 
@@ -195,7 +200,10 @@ class MultiResSpecLoss(torch.nn.Module):
             ya = (torch.view_as_real(Y).square().sum(-1) + 1e-12).sqrt()
             ta = (torch.view_as_real(T).square().sum(-1) + 1e-12).sqrt()
             yc, tc = ya.pow(self.gamma), ta.pow(self.gamma)
-            loss = loss + torch.mean((yc - tc) ** 2)
+            diff = yc - tc
+            if self.under != 1.0:
+                diff = torch.where(diff < 0, diff * self.under, diff)
+            loss = loss + torch.mean(diff**2)
             yz = torch.view_as_real(Y / ya * yc)
             tz = torch.view_as_real(T / ta * tc)
             loss = loss + torch.mean((yz - tz) ** 2)
@@ -246,6 +254,8 @@ def main() -> None:
     ap.add_argument("--val-set", default="ls-dev")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-steps", type=int, default=0, help="stop after N steps (0: time only)")
+    ap.add_argument("--under", type=float, default=1.0, help="weight of target-removal errors")
+    ap.add_argument("--init", type=Path, help="start from this checkpoint (same variant)")
     args = ap.parse_args()
 
     out = ROOT / "results" / "train" / args.run
@@ -265,13 +275,18 @@ def main() -> None:
         prefetch_factor=4 if args.workers > 0 else None,
     )
     model = PersonalDfNet(args.variant).to(dev)
+    if args.init is not None:
+        init = torch.load(args.init, map_location="cpu")
+        if init["variant"] != args.variant:
+            raise SystemExit("--init has another variant")
+        model.load_state_dict(init["model"])
     cond = list(model.cond.proj.parameters())
     cond_ids = {id(p) for p in cond}
     base = [p for p in model.parameters() if id(p) not in cond_ids]
     opt = torch.optim.AdamW(
         [{"params": base, "lr": args.lr}, {"params": cond, "lr": args.lr_cond}], weight_decay=1e-6
     )
-    loss_fn = MultiResSpecLoss().to(dev)
+    loss_fn = MultiResSpecLoss(under=args.under).to(dev)
     validate = Validation(args.val_set, dev)
 
     def save(name: str, step: int, metrics: dict) -> None:
@@ -279,9 +294,13 @@ def main() -> None:
         torch.save(state, out / f"{name}.pt")
 
     ref = validate(model)
-    budget = ref["target_loss_db"] + 0.8
-    best = ref["other_suppression_db"]
-    record = {"step": 0, "val": ref, "note": "step 0 = DFN3"}
+    budget = (DFN3_DEV_LOSS_DB if args.init is not None else ref["target_loss_db"]) + 0.8
+
+    def score(val: dict) -> float:
+        return val["other_suppression_db"] - 5 * max(0.0, val["target_loss_db"] - budget)
+
+    best = score(ref)
+    record = {"step": 0, "val": ref, "note": f"step 0 = {args.init or 'DFN3'}", "under": args.under}
     print(json.dumps(record), flush=True)
     log.write(json.dumps(record) + "\n")
 
@@ -321,10 +340,10 @@ def main() -> None:
         done = time.time() - start > args.hours * 3600 or (args.max_steps and step >= args.max_steps)
         if step % args.val_every == 0 or done:
             val = validate(model)
-            score = val["other_suppression_db"] - 5 * max(0.0, val["target_loss_db"] - budget)
-            rec = {"step": step, "val": val, "score": score}
-            if score > best:
-                best = score
+            s = score(val)
+            rec = {"step": step, "val": val, "score": s}
+            if s > best:
+                best = s
                 save("best", step, val)
                 rec["best"] = True
             save("last", step, val)
