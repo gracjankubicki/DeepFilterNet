@@ -5,16 +5,20 @@
 - sisdr_both_db: SI-SDR of the output against the target on "target + other".
 - picked_target: output closer to the target than to the other talker on "target + other".
 - long_cuts: runs > 1 s on "target only" where the output is >= 10 dB below the target.
+- overlap_other_db: on "target + other", least-squares fit out = a*target + b*other + rest;
+  -20 log10 |b|, i.e. how much the other talker was lowered while both talk.
+- band_<lo>_<hi>_db: on "target only", output vs target level per band (timbre).
 """
 
 import numpy as np
-from scipy.signal import fftconvolve
+from scipy.signal import fftconvolve, welch
 
 from .audio import FRAME, active_mask, db, frame_energy
 
 MAX_LAG = 4_800  # 100 ms
 CUT_DB = 10.0
 CUT_MIN_FRAMES = 50  # 1 s of 20 ms frames
+BANDS = ((100, 500), (500, 2000), (2000, 5000), (5000, 11000))
 
 
 def estimate_lag(out: np.ndarray, ref: np.ndarray, max_lag: int = MAX_LAG) -> int:
@@ -37,6 +41,21 @@ def si_sdr(est: np.ndarray, ref: np.ndarray) -> float:
         return float("nan")
     proj = np.dot(est, ref) / ref_energy * ref
     return db(np.dot(proj, proj) / max(np.dot(est - proj, est - proj), 1e-12))
+
+
+def overlap_other_db(out: np.ndarray, target: np.ndarray, other: np.ndarray) -> float:
+    coef, *_ = np.linalg.lstsq(np.stack([target, other], axis=1), out, rcond=None)
+    return float(-20 * np.log10(abs(coef[1]) + 1e-6))
+
+
+def band_levels_db(out: np.ndarray, target: np.ndarray, sr: int = 48_000) -> dict[str, float]:
+    f, p_out = welch(out, sr, nperseg=2048)
+    _, p_ref = welch(target, sr, nperseg=2048)
+    res = {}
+    for lo, hi in BANDS:
+        sel = (f >= lo) & (f < hi)
+        res[f"band_{lo}_{hi}_db"] = db(p_out[sel].sum() / max(p_ref[sel].sum(), 1e-20))
+    return res
 
 
 def long_cuts(out: np.ndarray, target: np.ndarray) -> tuple[int, float]:
@@ -87,4 +106,5 @@ def evaluate(
         "picked_target": bool(sdr_target > sdr_other),
         "long_cuts": runs,
         "long_cut_seconds": seconds,
-    }
+        "overlap_other_db": overlap_other_db(o_both, cut(target, "both"), cut(other, "both")),
+    } | band_levels_db(o_target, r_target)

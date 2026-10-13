@@ -1,9 +1,10 @@
-"""Pick a run's checkpoint on ls-dev only: highest suppression with target loss within budget.
+"""Pick a run's checkpoint on the dev set only (never on evaluation sets).
 
 uv run python -m voice002.pick results/train/film-v1
 
-Budget: DFN3's ls-dev target loss + 0.8 dB (train.py). Only checkpoints kept on disk
-(best.pt, last.pt, step-N.pt) are candidates. Prints the path; evaluation sets are never used.
+New runs (log with "delta"): highest score of train.criterion_score among checkpoints that
+keep target loss and band change within 2.5 dB of DFN3. Old runs: highest suppression with
+target loss within DFN3 + 0.8 dB. Only step-N.pt files on disk are candidates.
 """
 
 import argparse
@@ -18,15 +19,24 @@ def select(run: Path, budget: float = DFN3_DEV_LOSS_DB + 0.8) -> tuple[Path, dic
     for line in open(run / "log.jsonl"):
         r = json.loads(line)
         if "val" in r and r["step"] > 0:
-            vals[r["step"]] = r["val"]
+            vals[r["step"]] = r
     best = None
-    for step, val in vals.items():
+    for step, r in vals.items():
         path = run / f"step-{step}.pt"
-        if not path.exists() or val["target_loss_db"] > budget:
+        if not path.exists():
             continue
-        if best is None or val["other_suppression_db"] > best[1]["other_suppression_db"]:
-            best = (path, val | {"step": step})
-    return best
+        if "delta" in r:
+            d = r["delta"]
+            if d["loss"] > 2.5 or d["band"] > 2.5:
+                continue
+            key = r["score"]
+        else:
+            if r["val"]["target_loss_db"] > budget:
+                continue
+            key = r["val"]["other_suppression_db"]
+        if best is None or key > best[2]:
+            best = (path, r.get("delta", r["val"]) | {"step": step}, key)
+    return None if best is None else best[:2]
 
 
 def main() -> None:

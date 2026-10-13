@@ -67,6 +67,25 @@ def test_perfect_extraction(mixture):
     assert abs(r["target_loss_db"]) < 0.01
     assert r["sisdr_both_db"] > 100
     assert r["picked_target"]
+    assert r["overlap_other_db"] > 60
+    assert all(abs(v) < 0.01 for k, v in r.items() if k.startswith("band_"))
+
+
+def test_overlap_measure_sees_leftover_other(mixture):
+    s = mixture.segments
+    out = mixture.target + 0.1 * mixture.other  # other lowered by 20 dB everywhere
+    r = run(mixture, out)
+    assert r["overlap_other_db"] == pytest.approx(20.0, abs=0.2)
+    assert r["other_suppression_db"] == pytest.approx(20.0, abs=0.2)
+
+
+def test_band_measure_sees_lost_highs(mixture):
+    from scipy.signal import butter, sosfiltfilt
+
+    lp = butter(8, 2000, fs=SR, output="sos")
+    r = run(mixture, sosfiltfilt(lp, mixture.target))
+    assert r["band_5000_11000_db"] < -20
+    assert abs(r["band_100_500_db"]) < 0.5
 
 
 def test_wrong_talker_is_detected(mixture):

@@ -1,11 +1,13 @@
-"""Criterion check of a system against a baseline on the same mixture set.
+"""Criterion check of a system against R2 on one mixture set (Target State annex 2026-10-13).
 
-uv run python -m voice002.compare user-v1 dfn3-a100 film-v1-best
+uv run python -m voice002.compare user-v1 dfn3-a100 film-v3-best
 
-Per configuration: extra other-talker suppression (>= 6 dB), extra target loss (<= 1 dB;
-Target State annex 2026-10-12: relative to R2), and how much the system lowers the target
-against the baseline while both talk ("overlap cut"). Writes compare-<baseline>.md next
-to the system outputs.
+Per configuration, relative to the baseline (R2):
+- other talker while both talk lowered by >= 20 dB (main measure),
+- other talker alone lowered by >= 26 dB,
+- target (voice at the microphone) at most 3 dB quieter,
+- timbre: per-band level change of the target at most 3 dB in every band.
+Metrics come from metrics.jsonl of both systems (evaluate.py / run_model.py).
 """
 
 import argparse
@@ -14,77 +16,82 @@ from collections import defaultdict
 
 import numpy as np
 
-from . import corpora
-from .audio import active_mask, frame_energy, load
-from .metrics import shift
+from .metrics import BANDS
 from .run_baseline import ROOT
 
-MIN_GAIN_DB = 6.0
-MAX_EXTRA_LOSS_DB = 1.0
+MIN_OVERLAP_DB = 20.0
+MIN_ALONE_DB = 26.0
+MAX_LOSS_DB = 3.0
+MAX_BAND_DB = 3.0
+BAND_KEYS = [f"band_{lo}_{hi}_db" for lo, hi in BANDS]
 
 
 def rows(path):
     return {r["name"]: r for r in map(json.loads, open(path / "metrics.jsonl"))}
 
 
-def overlap_cut(set_name: str, base_dir, sys_dir, name: str, base_row, sys_row) -> float:
-    mix_dir = corpora.DATA / "mix" / set_name
-    meta = json.loads((mix_dir / f"{name}.json").read_text())
-    a, b = meta["segments"]["both"]
-    n = len(load(mix_dir / f"{name}_mix.wav"))
-    t = load(mix_dir / f"{name}_target.wav")[a:b]
-    o_sys = shift(load(sys_dir / f"{name}_mix.wav"), sys_row["lag_samples"], n)[a:b]
-    o_base = shift(load(base_dir / f"{name}_mix.wav"), base_row["lag_samples"], n)[a:b]
-    m = active_mask(t)
-    return 10 * np.log10(frame_energy(o_base)[m].sum() / max(frame_energy(o_sys)[m].sum(), 1e-12))
+def deltas(base: dict, sys_: dict) -> dict[str, float]:
+    return {
+        "overlap": sys_["overlap_other_db"] - base["overlap_other_db"],
+        "alone": sys_["other_suppression_db"] - base["other_suppression_db"],
+        "loss": sys_["target_loss_db"] - base["target_loss_db"],
+        "band": max(abs(sys_[k] - base[k]) for k in BAND_KEYS),
+        "picked": float(sys_["picked_target"]),
+        "cuts": sys_["long_cuts"],
+    }
 
 
-def compare(set_name: str, baseline: str, system: str) -> str:
+def passes(m: dict) -> bool:
+    return (
+        m["overlap"] >= MIN_OVERLAP_DB
+        and m["alone"] >= MIN_ALONE_DB
+        and m["loss"] <= MAX_LOSS_DB
+        and m["band"] <= MAX_BAND_DB
+    )
+
+
+def summary(set_name: str, baseline: str, system: str) -> tuple[str, int, int]:
     res = ROOT / "results" / set_name
     base, sys_ = rows(res / baseline), rows(res / system)
     groups = defaultdict(list)
     for name, r in sys_.items():
-        b = base[name]
-        cut = overlap_cut(set_name, res / baseline, res / system, name, b, r)
-        key = (r["other_lang"], r["reverb"], r["level_db"])
-        groups[key].append(
-            (
-                r["other_suppression_db"] - b["other_suppression_db"],
-                r["target_loss_db"] - b["target_loss_db"],
-                cut,
-                r["picked_target"],
-                r["long_cuts"],
-            )
-        )
+        groups[(r["other_lang"], r["reverb"], r["level_db"])].append(deltas(base[name], r))
     lines = [
         f"# {system} vs {baseline} on {set_name}",
         "",
-        f"Criterion: extra suppression >= {MIN_GAIN_DB:g} dB and extra target loss <= "
-        f"{MAX_EXTRA_LOSS_DB:g} dB (means per configuration).",
+        f"Criterion (means per configuration, vs baseline): other while both talk >= "
+        f"{MIN_OVERLAP_DB:g} dB lower, other alone >= {MIN_ALONE_DB:g} dB lower, target "
+        f"<= {MAX_LOSS_DB:g} dB quieter, every band within {MAX_BAND_DB:g} dB.",
         "",
-        "| other | room | level dB | n | extra suppression dB | extra target loss dB | overlap cut dB | picked target % | long cuts | criterion |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| other | room | level dB | n | other, both talk dB | other alone dB | target loss dB | max band change dB | picked % | long cuts | criterion |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     passed = 0
     for key in sorted(groups, key=lambda k: (k[0], k[1], -k[2])):
-        g = np.array(groups[key], dtype=float)
-        gain, loss, cut, picked, cuts = g.mean(axis=0)
-        ok = gain >= MIN_GAIN_DB and loss <= MAX_EXTRA_LOSS_DB
+        g = groups[key]
+        m = {k: float(np.mean([d[k] for d in g])) for k in ("overlap", "alone", "loss", "band", "picked")}
+        ok = passes(m)
         passed += ok
         lines.append(
-            f"| {key[0]} | {'reverb' if key[1] else 'dry'} | {key[2]} | {len(g)} | {gain:+.1f} "
-            f"| {loss:+.2f} | {cut:.1f} | {100 * picked:.0f} | {int(g[:, 4].sum())} | {'PASS' if ok else 'fail'} |"
+            f"| {key[0]} | {'reverb' if key[1] else 'dry'} | {key[2]} | {len(g)} | {m['overlap']:+.1f} "
+            f"| {m['alone']:+.1f} | {m['loss']:+.2f} | {m['band']:.1f} | {100 * m['picked']:.0f} "
+            f"| {sum(d['cuts'] for d in g)} | {'PASS' if ok else 'fail'} |"
         )
-    all_ = np.array([v for g in groups.values() for v in g], dtype=float)
+    all_ = [d for g in groups.values() for d in g]
+    mean = lambda k: float(np.mean([d[k] for d in all_]))
     lines += [
         "",
-        f"All: extra suppression {all_[:, 0].mean():+.1f} dB, extra target loss "
-        f"{all_[:, 1].mean():+.2f} dB, overlap cut {all_[:, 2].mean():.1f} dB; "
+        f"All: other both talk {mean('overlap'):+.1f} dB, other alone {mean('alone'):+.1f} dB, "
+        f"target loss {mean('loss'):+.2f} dB, max band change {mean('band'):.1f} dB; "
         f"configurations passing: {passed}/{len(groups)}.",
         "",
     ]
-    text = "\n".join(lines)
-    (res / system / f"compare-{baseline}.md").write_text(text)
+    return "\n".join(lines), passed, len(groups)
+
+
+def compare(set_name: str, baseline: str, system: str) -> str:
+    text, _, _ = summary(set_name, baseline, system)
+    (ROOT / "results" / set_name / system / f"compare-{baseline}.md").write_text(text)
     return text
 
 
