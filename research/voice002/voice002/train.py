@@ -313,19 +313,21 @@ def freeze_batchnorm_affine(model: torch.nn.Module) -> None:
                 p.requires_grad_(False)
 
 
-def load_init(model: PersonalDfNet, path: Path) -> None:
+def load_init(model: PersonalDfNet, path: Path) -> dict | None:
     """Same variant, or a "film" checkpoint into "both"/"both-sim": the new projections
-    stay at zero, so the model starts exactly as the checkpoint."""
+    stay at zero, so the model starts exactly as the checkpoint. Returns the checkpoint
+    for a same-variant resume (its "opt" and "step" continue the run), else None."""
     init = torch.load(path, map_location="cpu")
     if init["variant"] == model.variant:
         model.load_state_dict(init["model"])
-        return
+        return init
     if init["variant"] != "film" or model.variant not in ("both", "both-sim"):
         raise SystemExit(f"--init {init['variant']} does not fit {model.variant}")
     missing, unexpected = model.load_state_dict(init["model"], strict=False)
     new = [k for k in missing if ".proj_in." not in k and ".proj_sim." not in k]
     if new or unexpected:
         raise SystemExit(f"--init mismatch: missing {new}, unexpected {unexpected}")
+    return None
 
 
 def main() -> None:
@@ -366,8 +368,9 @@ def main() -> None:
         prefetch_factor=4 if args.workers > 0 else None,
     )
     model = PersonalDfNet(args.variant).to(dev)
+    resumed = None
     if args.init is not None:
-        load_init(model, args.init)
+        resumed = load_init(model, args.init)
     freeze_batchnorm_affine(model)
     cond = model.cond.projection_parameters() if model.cond is not None else []
     cond_ids = {id(p) for p in cond}
@@ -376,23 +379,45 @@ def main() -> None:
     if cond:
         groups.append({"params": cond, "lr": args.lr_cond})
     opt = torch.optim.AdamW(groups, weight_decay=1e-6)
+    # Resuming a run (same variant) keeps Adam's moments and the step count, so a run split
+    # into processes (MPS breaks after in-process validation) trains like one process.
+    first_step = 0
+    if resumed is not None:
+        if "opt" in resumed:
+            opt.load_state_dict(resumed["opt"])
+        first_step = int(resumed.get("step", 0))
     loss_fn = MultiResSpecLoss(under=args.under, other_weight=args.other_weight).to(dev)
     validate = Validation(args.val_set, dev, with_sim)
 
     def save(name: str, step: int, metrics: dict) -> None:
-        state = {"variant": args.variant, "model": model.state_dict(), "step": step, "dev": metrics}
+        state = {
+            "variant": args.variant,
+            "model": model.state_dict(),
+            "opt": opt.state_dict(),
+            "step": step,
+            "best_score": best,
+            "dev": metrics,
+        }
         torch.save(state, out / f"{name}.pt")
 
     # Reference: plain DFN3 (torch) on the dev set; scores are relative to it.
     ref = validate(PersonalDfNet("none"))
     val0 = validate(model)
     best, _ = criterion_score(val0, ref)
-    record = {"step": 0, "val": val0, "ref": ref, "args": {k: str(v) for k, v in vars(args).items()}}
+    if resumed is not None and "best_score" in resumed:
+        best = resumed["best_score"]
+    record = {
+        "step": first_step,
+        "val": val0,
+        "ref": ref,
+        "resumed_opt": resumed is not None and "opt" in resumed,
+        "args": {k: str(v) for k, v in vars(args).items()},
+    }
     print(json.dumps(record), flush=True)
     log.write(json.dumps(record) + "\n")
 
     start = time.time()
-    step, running, skipped = 0, [], 0
+    step, running, skipped = first_step, [], 0
     for mix, target, other, emb, sim in loader:
         model.train()
         freeze_batchnorm(model)
@@ -435,7 +460,9 @@ def main() -> None:
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
-        done = time.time() - start > args.hours * 3600 or (args.max_steps and step >= args.max_steps)
+        done = time.time() - start > args.hours * 3600 or (
+            args.max_steps and step - first_step >= args.max_steps
+        )
         if step % args.val_every == 0 or done:
             val = validate(model)
             s, d = criterion_score(val, ref)

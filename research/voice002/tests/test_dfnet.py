@@ -90,6 +90,44 @@ def test_sim_hop_matches_the_gate_config():
     assert SIM_HOP_FRAMES * HOP == round(SIM_CFG.hop_s * 48_000)
 
 
+def _opt(model):
+    cond = model.cond.projection_parameters()
+    ids = {id(p) for p in cond}
+    base = [p for p in model.parameters() if id(p) not in ids]
+    return torch.optim.AdamW([{"params": base, "lr": 1e-4}, {"params": cond, "lr": 1e-3}])
+
+
+@pytest.mark.skipif(not CHECKPOINT.exists(), reason="needs the DFN3 checkpoint")
+def test_resume_with_optimizer_continues_exactly(tmp_path):
+    torch.manual_seed(0)
+    x = torch.randn(1, 20 * HOP) * 0.05
+    t = x * 0.5
+    spk = torch.nn.functional.normalize(torch.randn(1, 192), dim=1)
+    sim = torch.randn(1, 2, 2)
+    loss = MultiResSpecLoss()
+
+    def step(model, opt):
+        opt.zero_grad()
+        loss(model(x, spk, sim), t).backward()
+        opt.step()
+
+    a = PersonalDfNet("both-sim").eval()
+    opt_a = _opt(a)
+    step(a, opt_a)
+    path = tmp_path / "ck.pt"
+    torch.save({"variant": "both-sim", "model": a.state_dict(), "opt": opt_a.state_dict(), "step": 1}, path)
+    step(a, opt_a)
+
+    b = PersonalDfNet("both-sim").eval()
+    resumed = load_init(b, path)
+    opt_b = _opt(b)
+    opt_b.load_state_dict(resumed["opt"])
+    assert resumed["step"] == 1
+    step(b, opt_b)
+    for (name, pa), pb in zip(a.named_parameters(), b.parameters()):
+        torch.testing.assert_close(pb, pa, msg=name)
+
+
 def test_spectral_loss_is_finite_on_silence_and_zero_when_equal():
     loss = MultiResSpecLoss()
     silent = torch.zeros(1, 9600, requires_grad=True)
