@@ -27,7 +27,23 @@ MIN_FRAMES = 20  # 0.2 s; shorter input gives no meaningful embedding
 def _session(path: Path = MODEL) -> ort.InferenceSession:
     if not path.exists():
         raise SystemExit(f"missing {path}; see voice002/embedding.py for the download")
-    return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    opts = ort.SessionOptions()
+    if _THREADS:
+        opts.intra_op_num_threads = _THREADS
+        opts.inter_op_num_threads = 1
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    return ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
+
+
+_THREADS = 0  # 0: onnxruntime default (all cores)
+
+
+def set_threads(n: int) -> None:
+    """Limit CAM++ to n threads in this process. Data loader workers use 1: several
+    processes each spinning a full thread pool starved one another (2026-10-13)."""
+    global _THREADS
+    _THREADS = n
+    _session.cache_clear()
 
 
 def _options(high_freq: float) -> knf.FbankOptions:

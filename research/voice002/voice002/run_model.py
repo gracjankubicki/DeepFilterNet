@@ -13,6 +13,7 @@ import torch
 
 from . import corpora
 from . import embedding as E
+from . import gate
 from .audio import load, save
 from .dfnet import PersonalDfNet
 from .evaluate import write
@@ -42,11 +43,14 @@ def run(set_name: str, checkpoint: Path | None, label: str | None = None) -> Pat
     for mix in sorted(mix_dir.glob("*_mix.wav")):
         name = mix.name.removesuffix("_mix.wav")
         x = torch.tensor(load(mix), dtype=torch.float32, device=dev)[None]
-        spk = None
+        spk = sim = None
         if model.variant != "none":
             enroll = E.embed(load(mix_dir / f"{name}_enroll.wav"))
             spk = torch.tensor(enroll, dtype=torch.float32, device=dev)[None]
-        save(out_dir / mix.name, model(x, spk)[0].cpu().numpy())
+            if model.uses_sim:
+                cue = gate.sim_features(load(mix), enroll)
+                sim = torch.tensor(cue, device=dev)[None]
+        save(out_dir / mix.name, model(x, spk, sim)[0].cpu().numpy())
     return out_dir
 
 

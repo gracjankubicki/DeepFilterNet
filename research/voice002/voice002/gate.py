@@ -85,6 +85,22 @@ def similarities(
     return sims
 
 
+# Midpoint of CAM++ 1 s window similarity, same speaker 0.571 vs other 0.294
+# (implementation-plans/evidence/voice-002/pomiary-2026-10-13.json in the voice repo).
+SIM_CENTRE = 0.43
+# 200 ms hop: half the CAM++ cost of 100 ms; must match dfnet.SIM_HOP_FRAMES (10 ms frames).
+SIM_CFG = GateConfig(window_s=1.0, hop_s=0.2)
+
+
+def sim_features(y: np.ndarray, enroll: np.ndarray, embedder: Embedder = E.embed_features) -> np.ndarray:
+    """Per-200 ms cue for PersonalDfNet "-sim" variants: [n_hops, 2] float32 with
+    ((similarity - centre) * valid, valid); hops with too little past speech are 0, 0."""
+    sims = similarities(y, enroll, SIM_CFG, embedder)
+    valid = ~np.isnan(sims)
+    centred = np.where(valid, np.nan_to_num(sims) - SIM_CENTRE, 0.0)
+    return np.stack([centred, valid.astype(np.float64)], axis=1).astype(np.float32)
+
+
 def hop_gains_db(sims: np.ndarray, cfg: GateConfig) -> np.ndarray:
     """Map similarity to gain; NaN hops hold the previous gain (open at the start)."""
     span = max(cfg.th_hi - cfg.th_lo, 1e-6)

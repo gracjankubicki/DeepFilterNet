@@ -4,7 +4,15 @@ import pytest
 from voice002 import corpora
 from voice002 import embedding as E
 from voice002.audio import SR
-from voice002.gate import GateConfig, apply, hop_gains_db, similarities, smooth_gain
+from voice002.gate import (
+    SIM_CENTRE,
+    GateConfig,
+    apply,
+    hop_gains_db,
+    sim_features,
+    similarities,
+    smooth_gain,
+)
 
 
 def stub_embedder(feats):
@@ -45,6 +53,20 @@ def test_decisions_use_only_past_audio():
         before[: hops_before_change + 1], after[: hops_before_change + 1], rtol=1e-5
     )
     assert not np.allclose(before[hops_before_change + 2 :], after[hops_before_change + 2 :])
+
+
+def test_sim_features_centre_valid_flag_and_silence():
+    rng = np.random.default_rng(0)
+    y = np.concatenate([np.zeros(SR), rng.standard_normal(2 * SR) * 0.05])
+    enroll = stub_embedder(E.fbank(E.to_16k(y[SR:]))[None])[0]
+    f = sim_features(y, enroll, stub_embedder)
+    sims = similarities(y, enroll, GateConfig(window_s=1.0, hop_s=0.2), stub_embedder)
+    assert f.shape == (15, 2) and f.dtype == np.float32
+    valid = ~np.isnan(sims)
+    assert not valid[:5].any() and valid[-3:].all()  # the first second is silence
+    np.testing.assert_array_equal(f[:, 1], valid.astype(np.float32))
+    np.testing.assert_allclose(f[valid, 0], sims[valid] - SIM_CENTRE, rtol=1e-5)
+    assert (f[~valid] == 0).all()
 
 
 @pytest.mark.skipif(

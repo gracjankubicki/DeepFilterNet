@@ -2,8 +2,18 @@ import numpy as np
 import pytest
 import torch
 
-from voice002.dfnet import CHECKPOINT, FFT, HOP, Features, PersonalDfNet, erb_widths, norm_alpha
-from voice002.train import MultiResSpecLoss
+from voice002.dfnet import (
+    CHECKPOINT,
+    FFT,
+    HOP,
+    SIM_HOP_FRAMES,
+    Features,
+    PersonalDfNet,
+    erb_widths,
+    frames_from_hops,
+    norm_alpha,
+)
+from voice002.train import MultiResSpecLoss, load_init
 
 
 def test_erb_widths_cover_all_bins():
@@ -34,16 +44,50 @@ def test_ema_matches_the_recursion():
 
 
 @pytest.mark.skipif(not CHECKPOINT.exists(), reason="needs the DFN3 checkpoint")
-@pytest.mark.parametrize("variant", ["film", "enc"])
+@pytest.mark.parametrize("variant", ["film", "enc", "both", "both-sim"])
 def test_fresh_conditioning_equals_dfn3(variant):
     torch.manual_seed(0)
     x = torch.randn(1, 20 * HOP) * 0.05
     spk = torch.nn.functional.normalize(torch.randn(1, 192), dim=1)
+    sim = torch.randn(1, 3, 2)
     with torch.no_grad():
         base = PersonalDfNet("none").eval()(x)
-        cond = PersonalDfNet(variant).eval()(x, spk)
+        cond = PersonalDfNet(variant).eval()(x, spk, sim)
     torch.testing.assert_close(cond, base)
     assert cond.shape == x.shape
+
+
+@pytest.mark.skipif(not CHECKPOINT.exists(), reason="needs the DFN3 checkpoint")
+def test_film_checkpoint_in_both_sim_starts_identical(tmp_path):
+    torch.manual_seed(0)
+    film = PersonalDfNet("film").eval()
+    for p in film.cond.proj.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    path = tmp_path / "film.pt"
+    torch.save({"variant": "film", "model": film.state_dict()}, path)
+    combo = PersonalDfNet("both-sim").eval()
+    load_init(combo, path)
+    x = torch.randn(1, 30 * HOP) * 0.05
+    spk = torch.nn.functional.normalize(torch.randn(1, 192), dim=1)
+    with torch.no_grad():
+        expect = film(x, spk)
+        got = combo(x, spk, torch.randn(1, 4, 2))
+    torch.testing.assert_close(got, expect)
+    assert not torch.allclose(expect, PersonalDfNet("none").eval()(x))
+
+
+def test_sim_cue_reaches_frames_without_lookahead():
+    sim = torch.arange(4, dtype=torch.float32).view(1, 4, 1)
+    frames = frames_from_hops(sim, 85)
+    assert frames.shape == (1, 85, 1)
+    # frame i (10 ms) uses hop i // 20 (200 ms); past the last hop it is held.
+    assert frames[0, :, 0].tolist() == [i // 20 if i < 80 else 3 for i in range(85)]
+
+
+def test_sim_hop_matches_the_gate_config():
+    from voice002.gate import SIM_CFG
+
+    assert SIM_HOP_FRAMES * HOP == round(SIM_CFG.hop_s * 48_000)
 
 
 def test_spectral_loss_is_finite_on_silence_and_zero_when_equal():

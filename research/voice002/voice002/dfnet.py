@@ -7,7 +7,12 @@ torch. A small `libdf` stand-in only provides what the model code imports.
 Conditioning on the CAM++ fingerprint (192 dims) wraps the encoder GRU:
 - "film": emb * (1 + gamma) + beta on the GRU output (feeds the ERB and DF decoders);
 - "enc": the projected fingerprint is added to the GRU input (the shared encoder).
-Both projections start at zero, so a fresh model behaves exactly like DFN3.
+- "both": "enc" and "film" together.
+- suffix "-sim" (e.g. "both-sim"): a per-frame cue "does the enrolled voice speak now"
+  (CAM++ similarity of the past 1 s of the input, see gate.sim_features) is projected and
+  added to the same conditioning, like the similarity refinement of arXiv 2601.16235.
+All projections start at zero, so a fresh model behaves exactly like DFN3, and a "film"
+checkpoint loaded into "both"/"both-sim" behaves exactly like that checkpoint.
 """
 
 import math
@@ -30,10 +35,12 @@ MIN_NB_ERB_FREQS = 2
 MEAN_NORM_INIT = (-60.0, -90.0)
 UNIT_NORM_INIT = (0.001, 0.0001)
 SPK_DIM = 192
+SIM_DIM = 2  # (similarity - centre) * valid, valid
+SIM_HOP_FRAMES = 20  # one similarity per 200 ms = 20 DFN frames (gate.SIM_CFG.hop_s)
 DF_ROOT = Path(__file__).resolve().parents[3] / "DeepFilterNet"
 MODEL_DIR = DATA / "models" / "dfn3" / "DeepFilterNet3"
 CHECKPOINT = MODEL_DIR / "checkpoints" / "model_120.ckpt.best"
-VARIANTS = ("none", "film", "enc")
+VARIANTS = ("none", "film", "enc", "both", "both-sim")
 
 
 def _freq2erb(f: float) -> float:
@@ -159,24 +166,68 @@ class Features(nn.Module):
 
 
 class SpeakerCondition(nn.Module):
-    """Wraps the encoder GRU; `spk` [B, 192] is set before each forward."""
+    """Wraps the encoder GRU; `spk` [B, 192] (and `sim` [B, T, 2] for "-sim") is set
+    before each forward."""
 
-    def __init__(self, gru: nn.Module, dim: int, mode: str):
+    def __init__(self, gru: nn.Module, in_dim: int, out_dim: int, mode: str, use_sim: bool = False):
         super().__init__()
         self.gru = gru
         self.mode = mode
-        self.proj = nn.Linear(SPK_DIM, dim * (2 if mode == "film" else 1))
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        self.in_dim = in_dim if mode in ("enc", "both") else 0
+        self.film_dim = 2 * out_dim if mode in ("film", "both") else 0
+        # Names keep old checkpoints loadable: "film" and "enc" used a single `proj`.
+        if mode == "enc":
+            self.proj = _zero_linear(SPK_DIM, in_dim)
+        else:
+            self.proj = _zero_linear(SPK_DIM, self.film_dim)
+        self.proj_in = _zero_linear(SPK_DIM, in_dim) if mode == "both" else None
+        self.proj_sim = _zero_linear(SIM_DIM, self.in_dim + self.film_dim) if use_sim else None
         self.spk: Tensor | None = None
+        self.sim: Tensor | None = None
+
+    def projection_parameters(self) -> list[nn.Parameter]:
+        mods = [m for m in (self.proj, self.proj_in, self.proj_sim) if m is not None]
+        return [p for m in mods for p in m.parameters()]
+
+    def _cues(self, t: int) -> tuple[Tensor | None, Tensor | None]:
+        """Additive input term [B, 1|T, in] and FiLM term [B, 1|T, 2*out]."""
+        c_in = c_film = None
+        if self.mode == "enc":
+            c_in = self.proj(self.spk)[:, None, :]
+        elif self.mode == "film":
+            c_film = self.proj(self.spk)[:, None, :]
+        else:
+            c_in = self.proj_in(self.spk)[:, None, :]
+            c_film = self.proj(self.spk)[:, None, :]
+        if self.proj_sim is not None:
+            s = self.proj_sim(frames_from_hops(self.sim, t))
+            if c_in is not None:
+                c_in = c_in + s[..., : self.in_dim]
+            if c_film is not None:
+                c_film = c_film + s[..., self.in_dim :]
+        return c_in, c_film
 
     def forward(self, x: Tensor):
-        c = self.proj(self.spk)[:, None, :]
-        if self.mode == "enc":
-            return self.gru(x + c)
-        y, h = self.gru(x)
-        gamma, beta = c.chunk(2, dim=-1)
+        c_in, c_film = self._cues(x.shape[1])
+        y, h = self.gru(x + c_in if c_in is not None else x)
+        if c_film is None:
+            return y, h
+        gamma, beta = c_film.chunk(2, dim=-1)
         return y * (1 + gamma) + beta, h
+
+
+def _zero_linear(n_in: int, n_out: int) -> nn.Linear:
+    lin = nn.Linear(n_in, n_out)
+    nn.init.zeros_(lin.weight)
+    nn.init.zeros_(lin.bias)
+    return lin
+
+
+def frames_from_hops(sim: Tensor, t: int) -> Tensor:
+    """[B, H, C] values per 200 ms hop -> [B, t, C] per DFN frame (10 ms); frame i takes hop
+    i // 20, the last hop is held. Hop k is computed from audio before k * 200 ms."""
+    idx = (torch.arange(t, device=sim.device) // SIM_HOP_FRAMES).clamp_max(sim.shape[1] - 1)
+    return sim[:, idx, :]
 
 
 class DepthwiseConvT(nn.Module):
@@ -226,16 +277,20 @@ class PersonalDfNet(nn.Module):
             net.load_state_dict({k.replace("clc", "df"): v for k, v in state.items()})
         _replace_convt(net)
         self.variant = variant
+        self.uses_sim = variant.endswith("-sim")
+        mode = variant.removesuffix("-sim")
         self.cond: SpeakerCondition | None = None
         if variant != "none":
-            dim = net.enc.emb_in_dim if variant == "enc" else net.enc.emb_out_dim
-            self.cond = SpeakerCondition(net.enc.emb_gru, dim, variant)
+            self.cond = SpeakerCondition(
+                net.enc.emb_gru, net.enc.emb_in_dim, net.enc.emb_out_dim, mode, self.uses_sim
+            )
             net.enc.emb_gru = self.cond
         self.net = net
         self.feat = Features()
 
-    def forward(self, audio: Tensor, spk: Tensor | None = None) -> Tensor:
-        """audio [B, N] at 48 kHz -> enhanced [B, N], aligned with the input."""
+    def forward(self, audio: Tensor, spk: Tensor | None = None, sim: Tensor | None = None) -> Tensor:
+        """audio [B, N] at 48 kHz -> enhanced [B, N], aligned with the input.
+        sim [B, H, 2]: per-100 ms cue from gate.sim_features (only "-sim" variants)."""
         n = audio.shape[-1]
         pad = (-n) % HOP + FFT
         spec = self.feat.analysis(nn.functional.pad(audio, (0, pad)))
@@ -244,6 +299,10 @@ class PersonalDfNet(nn.Module):
             if spk is None:
                 raise ValueError("this variant needs a fingerprint")
             self.cond.spk = spk
+            if self.uses_sim:
+                if sim is None:
+                    raise ValueError("this variant needs the similarity cue")
+                self.cond.sim = sim
         spec_r = torch.view_as_real(spec).unsqueeze(1)
         out = self.net(spec_r, erb, cplx)[0]
         enhanced = torch.view_as_complex(out.squeeze(1).contiguous())

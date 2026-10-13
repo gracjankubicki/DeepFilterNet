@@ -2,6 +2,8 @@
 
 uv run python -m voice002.train --variant film --run film-v1 --hours 8
 uv run python -m voice002.train --variant enc --run enc-v1 --hours 8
+uv run python -m voice002.train --variant both-sim --init results/train/film-v3b/step-2000.pt \
+    --other-weight 3 --run combo-v1 --hours 9
 
 Training speakers never appear in the evaluation sets: LibriSpeech train-clean-100 (EN)
 and Common Voice PL validated clips of speakers outside test.tsv and dev.tsv. Each speaker's
@@ -25,8 +27,9 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from . import corpora
 from . import embedding as E
+from . import gate
 from .audio import SR, active_rms, load
-from .dfnet import PersonalDfNet
+from .dfnet import VARIANTS, PersonalDfNet
 from .metrics import evaluate
 from .mixtures import pink_noise, synthetic_rir
 from .run_baseline import ROOT
@@ -115,6 +118,7 @@ class Mixtures(IterableDataset):
         seed: int,
         mode: str = "personal",
         p_cv_target: float = 0.7,
+        with_sim: bool = False,
     ):
         self.names = sorted(spk)
         self.cv_names = [n for n in self.names if n.startswith("cv-")]
@@ -127,6 +131,8 @@ class Mixtures(IterableDataset):
         # Common Voice targets keep the 8-12 kHz band (LibriSpeech stops at 8 kHz); too few
         # of them taught the first model to cut the high band of the user's voice.
         self.p_cv_target = p_cv_target
+        # CAM++ similarity cue of the mixture to the fingerprint (variants "-sim").
+        self.with_sim = with_sim
 
     def _track(self, clips: list[Path], pattern: str, rng) -> np.ndarray:
         out = np.zeros(N_SEG)
@@ -147,7 +153,7 @@ class Mixtures(IterableDataset):
         out[start : start + len(piece)] = piece * fade
         return out
 
-    def sample(self, rng) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def sample(self, rng) -> tuple[np.ndarray, ...]:
         pool = self.cv_names if rng.random() < self.p_cv_target else self.ls_names
         t_spk = pool[rng.integers(len(pool))]
         o_spk = t_spk
@@ -188,11 +194,14 @@ class Mixtures(IterableDataset):
         if peak > 0.95:
             mix, target, other = (s * 0.95 / peak for s in (mix, target, other))
         emb = self.enroll[t_spk][rng.integers(N_ENROLL)]
-        return mix.astype(np.float32), target.astype(np.float32), other.astype(np.float32), emb
+        sim = gate.sim_features(mix, emb) if self.with_sim else np.zeros((1, 2), np.float32)
+        return mix.astype(np.float32), target.astype(np.float32), other.astype(np.float32), emb, sim
 
     def __iter__(self):
         info = get_worker_info()
         wid = info.id if info else 0
+        if info is not None and self.with_sim:
+            E.set_threads(1)
         rng = np.random.default_rng([self.seed, wid, int(time.time())])
         while True:
             try:
@@ -245,15 +254,16 @@ class Validation:
     """Runs on a CPU copy of the model: on MPS, a backward after an eval-mode forward of the
     training model returned huge or non-finite gradients (2026-10-13), killing two runs."""
 
-    def __init__(self, set_name: str, dev: torch.device):
+    def __init__(self, set_name: str, dev: torch.device, with_sim: bool = False):
         mix_dir = corpora.DATA / "mix" / set_name
         self.items = []
         for meta_path in sorted(mix_dir.glob("*.json")):
             meta = json.loads(meta_path.read_text())
             n = meta["name"]
             st = {s: load(mix_dir / f"{n}_{s}.wav") for s in ("mix", "target", "other")}
-            emb = torch.tensor(E.embed(load(mix_dir / f"{n}_enroll.wav")), dtype=torch.float32)
-            self.items.append((st, emb, meta["segments"]))
+            enroll = E.embed(load(mix_dir / f"{n}_enroll.wav"))
+            sim = torch.tensor(gate.sim_features(st["mix"], enroll)) if with_sim else None
+            self.items.append((st, torch.tensor(enroll, dtype=torch.float32), sim, meta["segments"]))
         self.dev = torch.device("cpu")
 
     @torch.no_grad()
@@ -265,10 +275,11 @@ class Validation:
         model.load_state_dict(state)
         model.eval()
         rows = []
-        for st, emb, seg in self.items:
+        for st, emb, sim, seg in self.items:
             x = torch.tensor(st["mix"], dtype=torch.float32, device=self.dev)[None]
             spk = emb.to(self.dev)[None] if model.variant != "none" else None
-            y = model(x, spk)[0].cpu().double().numpy()
+            s = sim.to(self.dev)[None] if model.uses_sim else None
+            y = model(x, spk, s)[0].cpu().double().numpy()
             rows.append(evaluate(y, st["mix"], st["target"], st["other"], seg))
         keys = [k for k in rows[0] if k != "lag_samples"]
         return {k: float(np.mean([r[k] for r in rows])) for k in keys}
@@ -302,9 +313,24 @@ def freeze_batchnorm_affine(model: torch.nn.Module) -> None:
                 p.requires_grad_(False)
 
 
+def load_init(model: PersonalDfNet, path: Path) -> None:
+    """Same variant, or a "film" checkpoint into "both"/"both-sim": the new projections
+    stay at zero, so the model starts exactly as the checkpoint."""
+    init = torch.load(path, map_location="cpu")
+    if init["variant"] == model.variant:
+        model.load_state_dict(init["model"])
+        return
+    if init["variant"] != "film" or model.variant not in ("both", "both-sim"):
+        raise SystemExit(f"--init {init['variant']} does not fit {model.variant}")
+    missing, unexpected = model.load_state_dict(init["model"], strict=False)
+    new = [k for k in missing if ".proj_in." not in k and ".proj_sim." not in k]
+    if new or unexpected:
+        raise SystemExit(f"--init mismatch: missing {new}, unexpected {unexpected}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variant", choices=("film", "enc", "none"), required=True)
+    ap.add_argument("--variant", choices=VARIANTS, required=True)
     ap.add_argument("--mode", choices=("personal", "proximity"), default="personal")
     ap.add_argument("--other-weight", type=float, default=0.0)
     ap.add_argument("--p-cv-target", type=float, default=0.7)
@@ -319,7 +345,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-steps", type=int, default=0, help="stop after N steps (0: time only)")
     ap.add_argument("--under", type=float, default=1.0, help="weight of target-removal errors")
-    ap.add_argument("--init", type=Path, help="start from this checkpoint (same variant)")
+    ap.add_argument("--init", type=Path, help="start from this checkpoint (same variant, or film)")
     args = ap.parse_args()
 
     out = ROOT / "results" / "train" / args.run
@@ -331,8 +357,9 @@ def main() -> None:
     spk = speakers()
     print(f"{len(spk)} training speakers", flush=True)
     enroll = enrollment_cache(spk)
+    with_sim = args.variant.endswith("-sim")
     loader = DataLoader(
-        Mixtures(spk, enroll, args.seed, args.mode, args.p_cv_target),
+        Mixtures(spk, enroll, args.seed, args.mode, args.p_cv_target, with_sim),
         batch_size=args.batch,
         num_workers=args.workers,
         persistent_workers=args.workers > 0,
@@ -340,12 +367,9 @@ def main() -> None:
     )
     model = PersonalDfNet(args.variant).to(dev)
     if args.init is not None:
-        init = torch.load(args.init, map_location="cpu")
-        if init["variant"] != args.variant:
-            raise SystemExit("--init has another variant")
-        model.load_state_dict(init["model"])
+        load_init(model, args.init)
     freeze_batchnorm_affine(model)
-    cond = list(model.cond.proj.parameters()) if model.cond is not None else []
+    cond = model.cond.projection_parameters() if model.cond is not None else []
     cond_ids = {id(p) for p in cond}
     base = [p for p in model.parameters() if id(p) not in cond_ids and p.requires_grad]
     groups = [{"params": base, "lr": args.lr}]
@@ -353,7 +377,7 @@ def main() -> None:
         groups.append({"params": cond, "lr": args.lr_cond})
     opt = torch.optim.AdamW(groups, weight_decay=1e-6)
     loss_fn = MultiResSpecLoss(under=args.under, other_weight=args.other_weight).to(dev)
-    validate = Validation(args.val_set, dev)
+    validate = Validation(args.val_set, dev, with_sim)
 
     def save(name: str, step: int, metrics: dict) -> None:
         state = {"variant": args.variant, "model": model.state_dict(), "step": step, "dev": metrics}
@@ -369,10 +393,14 @@ def main() -> None:
 
     start = time.time()
     step, running, skipped = 0, [], 0
-    for mix, target, other, emb in loader:
+    for mix, target, other, emb, sim in loader:
         model.train()
         freeze_batchnorm(model)
-        y = model(mix.to(dev), emb.to(dev) if model.cond is not None else None)
+        y = model(
+            mix.to(dev),
+            emb.to(dev) if model.cond is not None else None,
+            sim.to(dev) if model.uses_sim else None,
+        )
         loss = loss_fn(y, target.to(dev), other.to(dev))
         opt.zero_grad(set_to_none=True)
         loss.backward()
