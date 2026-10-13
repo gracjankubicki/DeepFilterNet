@@ -179,6 +179,39 @@ class SpeakerCondition(nn.Module):
         return y * (1 + gamma) + beta, h
 
 
+class DepthwiseConvT(nn.Module):
+    """Depthwise ConvTranspose2d done as zero insertion + conv2d, with the same `weight`.
+
+    On MPS the weight gradient of the depthwise ConvTranspose2d in the ERB decoder turned
+    non-finite after a few steps and stayed so for the process (2026-10-13)."""
+
+    def __init__(self, convt: nn.ConvTranspose2d):
+        super().__init__()
+        assert convt.groups == convt.in_channels == convt.out_channels and convt.bias is None
+        assert convt.kernel_size[0] == 1 and convt.stride[0] == 1 and convt.dilation == (1, 1)
+        self.weight = convt.weight  # [C, 1, 1, K]
+        self.stride = convt.stride[1]
+        self.pad = convt.padding[1]
+        self.out_pad = convt.output_padding[1]
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, c, t, f = x.shape
+        k = self.weight.shape[-1]
+        up = x.new_zeros(b, c, t, (f - 1) * self.stride + 1)
+        up[..., :: self.stride] = x
+        lo, hi = k - 1 - self.pad, k - 1 - self.pad + self.out_pad
+        up = nn.functional.pad(up, (lo, hi))
+        return nn.functional.conv2d(up, self.weight.flip(-1), groups=c)
+
+
+def _replace_convt(module: nn.Module) -> None:
+    for name, child in module.named_children():
+        if isinstance(child, nn.ConvTranspose2d):
+            setattr(module, name, DepthwiseConvT(child))
+        else:
+            _replace_convt(child)
+
+
 class PersonalDfNet(nn.Module):
     """DFN3 (pretrained weights) + optional fingerprint conditioning; audio in, audio out."""
 
@@ -191,6 +224,7 @@ class PersonalDfNet(nn.Module):
         if checkpoint is not None:
             state = torch.load(checkpoint, map_location="cpu")
             net.load_state_dict({k.replace("clc", "df"): v for k, v in state.items()})
+        _replace_convt(net)
         self.variant = variant
         self.cond: SpeakerCondition | None = None
         if variant != "none":

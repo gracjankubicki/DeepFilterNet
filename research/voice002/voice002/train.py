@@ -12,7 +12,6 @@ above the step-0 model (= DFN3) + 0.8 dB.
 """
 
 import argparse
-import copy
 import csv
 import hashlib
 import json
@@ -259,7 +258,11 @@ class Validation:
 
     @torch.no_grad()
     def __call__(self, model: PersonalDfNet) -> dict[str, float]:
-        model = copy.deepcopy(model).to(self.dev)
+        # A fresh CPU model fed with a CPU copy of the weights; deepcopy of the MPS model
+        # itself left the training model producing non-finite gradients.
+        state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+        model = PersonalDfNet(model.variant, checkpoint=None)
+        model.load_state_dict(state)
         model.eval()
         rows = []
         for st, emb, seg in self.items:
