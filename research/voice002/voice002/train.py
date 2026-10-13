@@ -285,6 +285,15 @@ def freeze_batchnorm(model: torch.nn.Module) -> None:
             m.eval()
 
 
+def freeze_batchnorm_affine(model: torch.nn.Module) -> None:
+    """BatchNorm stays exactly as in DFN3. On MPS, backward after an eval forward (the
+    validation) returned non-finite gradients for these weights (2026-10-13)."""
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+            for p in m.parameters():
+                p.requires_grad_(False)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--variant", choices=("film", "enc", "none"), required=True)
@@ -327,9 +336,10 @@ def main() -> None:
         if init["variant"] != args.variant:
             raise SystemExit("--init has another variant")
         model.load_state_dict(init["model"])
+    freeze_batchnorm_affine(model)
     cond = list(model.cond.proj.parameters()) if model.cond is not None else []
     cond_ids = {id(p) for p in cond}
-    base = [p for p in model.parameters() if id(p) not in cond_ids]
+    base = [p for p in model.parameters() if id(p) not in cond_ids and p.requires_grad]
     groups = [{"params": base, "lr": args.lr}]
     if cond:
         groups.append({"params": cond, "lr": args.lr_cond})
