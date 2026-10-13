@@ -12,6 +12,7 @@ above the step-0 model (= DFN3) + 0.8 dB.
 """
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -242,6 +243,9 @@ class MultiResSpecLoss(torch.nn.Module):
 
 
 class Validation:
+    """Runs on a CPU copy of the model: on MPS, a backward after an eval-mode forward of the
+    training model returned huge or non-finite gradients (2026-10-13), killing two runs."""
+
     def __init__(self, set_name: str, dev: torch.device):
         mix_dir = corpora.DATA / "mix" / set_name
         self.items = []
@@ -251,10 +255,11 @@ class Validation:
             st = {s: load(mix_dir / f"{n}_{s}.wav") for s in ("mix", "target", "other")}
             emb = torch.tensor(E.embed(load(mix_dir / f"{n}_enroll.wav")), dtype=torch.float32)
             self.items.append((st, emb, meta["segments"]))
-        self.dev = dev
+        self.dev = torch.device("cpu")
 
     @torch.no_grad()
     def __call__(self, model: PersonalDfNet) -> dict[str, float]:
+        model = copy.deepcopy(model).to(self.dev)
         model.eval()
         rows = []
         for st, emb, seg in self.items:
@@ -352,7 +357,7 @@ def main() -> None:
         torch.save(state, out / f"{name}.pt")
 
     # Reference: plain DFN3 (torch) on the dev set; scores are relative to it.
-    ref = validate(PersonalDfNet("none").to(dev))
+    ref = validate(PersonalDfNet("none"))
     val0 = validate(model)
     best, _ = criterion_score(val0, ref)
     record = {"step": 0, "val": val0, "ref": ref, "args": {k: str(v) for k, v in vars(args).items()}}
