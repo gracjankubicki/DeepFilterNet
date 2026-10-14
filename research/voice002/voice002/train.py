@@ -14,6 +14,7 @@ above the step-0 model (= DFN3) + 0.8 dB.
 """
 
 import argparse
+import copy
 import csv
 import hashlib
 import json
@@ -323,6 +324,23 @@ def gpu_sync(dev: torch.device) -> None:
         torch.mps.synchronize()
 
 
+def snapshot(model: torch.nn.Module, opt: torch.optim.Optimizer) -> tuple[list[torch.Tensor], dict]:
+    """Weights and optimizer state before a step, for rolling back a corrupt step."""
+    return [p.detach().clone() for p in model.parameters()], copy.deepcopy(opt.state_dict())
+
+
+def weights_finite(model: torch.nn.Module) -> bool:
+    return all(bool(torch.isfinite(p).all()) for p in model.parameters())
+
+
+def restore(model: torch.nn.Module, opt: torch.optim.Optimizer, snap: tuple[list[torch.Tensor], dict]) -> None:
+    weights, opt_state = snap
+    with torch.no_grad():
+        for p, w in zip(model.parameters(), weights):
+            p.copy_(w)
+    opt.load_state_dict(opt_state)
+
+
 def atomic_save(state: dict, path: Path) -> None:
     """Write then rename: a crash mid-write must not destroy the last.pt a retry resumes."""
     tmp = path.with_name(f".{path.name}.tmp")
@@ -422,7 +440,12 @@ def main() -> None:
         if "opt" in resumed:
             opt.load_state_dict(resumed["opt"])
         first_step = int(resumed.get("step", 0))
-    loss_fn = MultiResSpecLoss(under=args.under, other_weight=args.other_weight).to(dev)
+    # The loss runs on the CPU: on MPS (torch 2.14.1) the backward of torch.stft is wrong
+    # for signals of 2 s and more (80-140 % relative error even on white noise; our
+    # batches are 4 s), so every MPS run trained on corrupt gradients and later NaNs
+    # (2026-10-14). The network itself backpropagates correctly on MPS; y.cpu() keeps
+    # the graph, so its gradient flows back to the MPS weights.
+    loss_fn = MultiResSpecLoss(under=args.under, other_weight=args.other_weight)
     validate = Validation(args.val_set, dev, with_sim)
 
     def save(name: str, step: int, metrics: dict) -> None:
@@ -460,7 +483,7 @@ def main() -> None:
     log.write(json.dumps(record) + "\n")
 
     start = time.time()
-    step, running, skipped = first_step, [], 0
+    step, running, skipped, rolled_back = first_step, [], 0, 0
     for mix, target, other, emb, sim in loader:
         model.train()
         freeze_batchnorm(model)
@@ -469,7 +492,7 @@ def main() -> None:
             emb.to(dev) if model.cond is not None else None,
             sim.to(dev) if model.uses_sim else None,
         )
-        loss = loss_fn(y, target.to(dev), other.to(dev))
+        loss = loss_fn(y.cpu(), target, other)
         opt.zero_grad(set_to_none=True)
         gpu_sync(dev)
         loss.backward()
@@ -492,6 +515,7 @@ def main() -> None:
                 )[:5]
                 note = {
                     "nonfinite": {
+                        "step": step,
                         "loss": float(loss.detach()),
                         "grad_norm": float(grad_norm),
                         "y_finite": bool(torch.isfinite(y).all()),
@@ -507,9 +531,25 @@ def main() -> None:
                 raise SystemExit("too many non-finite steps")
             continue
         torch.nn.utils.clip_grads_with_norm_(params, 1.0, grad_norm)
+        snap = snapshot(model, opt)
         gpu_sync(dev)
         opt.step()
         gpu_sync(dev)
+        # Finite gradients do not guarantee finite weights: a fresh combo-v3 run on MPS got
+        # NaN outputs on every batch shortly after the start (2026-10-14), while the same
+        # batch, weights and validation were finite in isolation. Roll a corrupt step back.
+        if not weights_finite(model):
+            restore(model, opt, snap)
+            gpu_sync(dev)
+            rolled_back += 1
+            note = {"corrupt_step": {"step": step + 1, "rolled_back": rolled_back,
+                                     "restored_finite": weights_finite(model)}}
+            print(json.dumps(note), flush=True)
+            log.write(json.dumps(note) + "\n")
+            log.flush()
+            if rolled_back > 50:
+                raise SystemExit("too many corrupt optimizer steps")
+            continue
         step += 1
         running.append(loss.item())
         if step % 100 == 0:
@@ -517,6 +557,7 @@ def main() -> None:
                 "step": step,
                 "loss": float(np.mean(running)),
                 "skipped": skipped,
+                "rolled_back": rolled_back,
                 "elapsed_s": round(time.time() - start),
             }
             running = []

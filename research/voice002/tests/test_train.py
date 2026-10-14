@@ -1,3 +1,4 @@
+import copy
 import json
 
 import pytest
@@ -5,7 +6,68 @@ import torch
 
 from voice002 import train
 from voice002.pick import select
-from voice002.train import atomic_save, start_record, stored_reference
+from voice002.train import (
+    MultiResSpecLoss,
+    atomic_save,
+    restore,
+    snapshot,
+    start_record,
+    stored_reference,
+    weights_finite,
+)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_loss_on_cpu_gives_mps_output_the_cpu_gradient():
+    # 4 s batches at 48 kHz, as in training; torch.stft's backward on MPS is wrong here.
+    torch.manual_seed(0)
+    y0, t, o = (torch.randn(2, 192000) * 0.1 for _ in range(3))
+    loss_fn = MultiResSpecLoss(other_weight=3.0)
+
+    ref = y0.clone().requires_grad_()
+    loss_fn(ref, t, o).backward()
+
+    y = y0.to("mps").requires_grad_()
+    loss_fn(y.cpu(), t, o).backward()
+    torch.mps.synchronize()
+    err = (y.grad.cpu() - ref.grad).norm() / ref.grad.norm()
+    assert err < 1e-4
+
+
+def test_corrupt_optimizer_step_is_rolled_back_exactly():
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.GRU(8, 8, batch_first=True))
+    # two groups with different settings, as in training (base + conditioning projections)
+    opt = torch.optim.AdamW(
+        [{"params": model[0].parameters(), "lr": 1e-3}, {"params": model[1].parameters(), "lr": 5e-4}],
+        weight_decay=1e-6,
+    )
+
+    def step():
+        out, _ = model[1](model[0](torch.randn(2, 3, 4)))
+        opt.zero_grad()
+        out.pow(2).mean().backward()
+        opt.step()
+
+    step()  # Adam has moments, so the state must come back as well
+    before = [p.detach().clone() for p in model.parameters()]
+    state_before = copy.deepcopy(opt.state_dict())
+    snap = snapshot(model, opt)
+    step()
+    with torch.no_grad():
+        next(model.parameters()).fill_(float("nan"))
+    assert not weights_finite(model)
+
+    restore(model, opt, snap)
+    assert weights_finite(model)
+    assert all(torch.equal(p, b) for p, b in zip(model.parameters(), before))
+    after = opt.state_dict()
+    assert after["param_groups"] == state_before["param_groups"]
+    for k, s in state_before["state"].items():
+        for name in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(after["state"][k][name], s[name])
+    step()  # training continues from the restored state
+    assert weights_finite(model)
 
 
 def test_atomic_save_replaces_and_leaves_no_temp(tmp_path):
