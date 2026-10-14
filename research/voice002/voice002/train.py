@@ -17,6 +17,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -313,6 +314,41 @@ def freeze_batchnorm_affine(model: torch.nn.Module) -> None:
                 p.requires_grad_(False)
 
 
+def gpu_sync(dev: torch.device) -> None:
+    """Wait for queued MPS work. Without it, eager MPS training intermittently returned
+    corrupt gradients (one layer ~1e32, or NaN through the backward) while the loss and the
+    output were correct; with it, 300 steps from the same failing checkpoint ran clean at the
+    same speed (2026-10-14; cf. pytorch#200104, #199680)."""
+    if dev.type == "mps":
+        torch.mps.synchronize()
+
+
+def atomic_save(state: dict, path: Path) -> None:
+    """Write then rename: a crash mid-write must not destroy the last.pt a retry resumes."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def stored_reference(resumed: dict | None, val_set: str) -> tuple[dict, dict | None, float] | None:
+    """(ref, start metrics, best score) of a resumed run when they can replace the start
+    validations: only from a checkpoint scored on the same validation set."""
+    if resumed is None or resumed.get("val_set") != val_set:
+        return None
+    if "ref" not in resumed or "best_score" not in resumed:
+        return None
+    return resumed["ref"], resumed.get("dev"), resumed["best_score"]
+
+
+def start_record(first_step: int, val0: dict | None, ref: dict, resumed_opt: bool, args: dict) -> dict:
+    """pick.py reads "val" records by step; a resumed start repeats the step of the last
+    validation, so its metrics go under "start_val" and never replace that record."""
+    record = {"step": first_step, "ref": ref, "resumed_opt": resumed_opt, "args": args}
+    if val0 is not None:
+        record["val" if first_step == 0 else "start_val"] = val0
+    return record
+
+
 def load_init(model: PersonalDfNet, path: Path) -> dict | None:
     """Same variant, or a "film" checkpoint into "both"/"both-sim": the new projections
     stay at zero, so the model starts exactly as the checkpoint. Returns the checkpoint
@@ -396,23 +432,30 @@ def main() -> None:
             "opt": opt.state_dict(),
             "step": step,
             "best_score": best,
+            "ref": ref,
+            "val_set": args.val_set,
             "dev": metrics,
         }
-        torch.save(state, out / f"{name}.pt")
+        atomic_save(state, out / f"{name}.pt")
 
-    # Reference: plain DFN3 (torch) on the dev set; scores are relative to it.
-    ref = validate(PersonalDfNet("none"))
-    val0 = validate(model)
-    best, _ = criterion_score(val0, ref)
-    if resumed is not None and "best_score" in resumed:
-        best = resumed["best_score"]
-    record = {
-        "step": first_step,
-        "val": val0,
-        "ref": ref,
-        "resumed_opt": resumed is not None and "opt" in resumed,
-        "args": {k: str(v) for k, v in vars(args).items()},
-    }
+    # Reference: plain DFN3 (torch) on the dev set; scores are relative to it. A resume
+    # with a stored reference skips both start validations: MPS training broke right after
+    # them at the start of a resumed process (combo-v2, step 3000, 2026-10-13 23:25).
+    # Checkpoints without a matching validation set are scored afresh, best score included.
+    stored = stored_reference(resumed, args.val_set)
+    if stored is not None:
+        ref, val0, best = stored
+    else:
+        ref = validate(PersonalDfNet("none"))
+        val0 = validate(model)
+        best, _ = criterion_score(val0, ref)
+    record = start_record(
+        first_step,
+        val0,
+        ref,
+        resumed is not None and "opt" in resumed,
+        {k: str(v) for k, v in vars(args).items()},
+    )
     print(json.dumps(record), flush=True)
     log.write(json.dumps(record) + "\n")
 
@@ -428,8 +471,13 @@ def main() -> None:
         )
         loss = loss_fn(y, target.to(dev), other.to(dev))
         opt.zero_grad(set_to_none=True)
+        gpu_sync(dev)
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        gpu_sync(dev)
+        # Norm first, clip only when finite: clipping with an infinite norm zeroed every
+        # gradient and hid the offending parameters (combo-v2, 2026-10-13).
+        params = [p for p in model.parameters() if p.grad is not None]
+        grad_norm = torch.nn.utils.get_total_norm([p.grad for p in params])
         if not (torch.isfinite(loss) and torch.isfinite(grad_norm)):
             # Keep the weights clean; keep the first bad batch for diagnosis.
             if skipped == 0:
@@ -438,7 +486,19 @@ def main() -> None:
                     n for n, p in model.named_parameters()
                     if p.grad is not None and not torch.isfinite(p.grad).all()
                 ]
-                note = {"nonfinite": {"loss": float(loss), "y_finite": bool(torch.isfinite(y).all()), "params": bad[:20]}}
+                big = sorted(
+                    ((float(p.grad.abs().max()), n) for n, p in model.named_parameters() if p.grad is not None),
+                    reverse=True,
+                )[:5]
+                note = {
+                    "nonfinite": {
+                        "loss": float(loss.detach()),
+                        "grad_norm": float(grad_norm),
+                        "y_finite": bool(torch.isfinite(y).all()),
+                        "params": bad[:20],
+                        "largest_grad": big,
+                    }
+                }
                 print(json.dumps(note), flush=True)
                 log.write(json.dumps(note) + "\n")
             skipped += 1
@@ -446,7 +506,10 @@ def main() -> None:
             if skipped > 50:
                 raise SystemExit("too many non-finite steps")
             continue
+        torch.nn.utils.clip_grads_with_norm_(params, 1.0, grad_norm)
+        gpu_sync(dev)
         opt.step()
+        gpu_sync(dev)
         step += 1
         running.append(loss.item())
         if step % 100 == 0:
