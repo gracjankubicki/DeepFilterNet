@@ -212,6 +212,22 @@ class Mixtures(IterableDataset):
                 continue
 
 
+def stft(x: torch.Tensor, n: int, window: torch.Tensor) -> torch.Tensor:
+    """torch.stft(x, n, n // 4, window=window, return_complex=True) from framing + rfft.
+
+    On MPS (torch 2.14.1) the backward of reflect padding (F.pad mode="reflect", used
+    inside torch.stft) is wrong for signals of 2 s and more (~80 % relative error even on
+    white noise; 2026-10-14), so the reflection is built from slices and flips here.
+    Same defaults: center=True, reflect padding, onesided; output [B, n // 2 + 1, frames].
+    """
+    p = n // 2
+    if x.shape[-1] <= p:
+        raise ValueError(f"signal of {x.shape[-1]} samples is too short for reflect padding of {p}")
+    x = torch.cat([x[:, 1 : p + 1].flip(-1), x, x[:, -p - 1 : -1].flip(-1)], dim=-1)
+    frames = x.unfold(-1, n, n // 4) * window
+    return torch.fft.rfft(frames, dim=-1).transpose(1, 2)
+
+
 class MultiResSpecLoss(torch.nn.Module):
     """DFN3's multi-resolution loss: compressed magnitude + compressed complex, gamma 0.3."""
 
@@ -232,8 +248,8 @@ class MultiResSpecLoss(torch.nn.Module):
         loss = y.new_zeros(())
         for n in self.ffts:
             w = getattr(self, f"win{n}")
-            Y = torch.stft(y, n, n // 4, window=w, return_complex=True)
-            T = torch.stft(t, n, n // 4, window=w, return_complex=True)
+            Y = stft(y, n, w)
+            T = stft(t, n, w)
             # sqrt(re^2 + im^2 + eps): Tensor.abs() of a complex zero has a NaN gradient.
             ya = (torch.view_as_real(Y).square().sum(-1) + 1e-12).sqrt()
             ta = (torch.view_as_real(T).square().sum(-1) + 1e-12).sqrt()
@@ -243,7 +259,7 @@ class MultiResSpecLoss(torch.nn.Module):
                 diff = torch.where(diff < 0, diff * self.under, diff)
             weight = 1.0
             if self.other_weight > 0 and o is not None:
-                O = torch.stft(o, n, n // 4, window=w, return_complex=True).abs()
+                O = stft(o, n, w).abs()
                 weight = 1.0 + self.other_weight * (O > ta).float()
             loss = loss + torch.mean(weight * diff**2)
             yz = torch.view_as_real(Y / ya * yc)
@@ -440,12 +456,9 @@ def main() -> None:
         if "opt" in resumed:
             opt.load_state_dict(resumed["opt"])
         first_step = int(resumed.get("step", 0))
-    # The loss runs on the CPU: on MPS (torch 2.14.1) the backward of torch.stft is wrong
-    # for signals of 2 s and more (80-140 % relative error even on white noise; our
-    # batches are 4 s), so every MPS run trained on corrupt gradients and later NaNs
-    # (2026-10-14). The network itself backpropagates correctly on MPS; y.cpu() keeps
-    # the graph, so its gradient flows back to the MPS weights.
-    loss_fn = MultiResSpecLoss(under=args.under, other_weight=args.other_weight)
+    # The loss uses stft() above: with torch.stft, every MPS run before 2026-10-14 trained
+    # on corrupt gradients (wrong reflect-padding backward for our 4 s batches).
+    loss_fn = MultiResSpecLoss(under=args.under, other_weight=args.other_weight).to(dev)
     validate = Validation(args.val_set, dev, with_sim)
 
     def save(name: str, step: int, metrics: dict) -> None:
@@ -492,7 +505,7 @@ def main() -> None:
             emb.to(dev) if model.cond is not None else None,
             sim.to(dev) if model.uses_sim else None,
         )
-        loss = loss_fn(y.cpu(), target, other)
+        loss = loss_fn(y, target.to(dev), other.to(dev))
         opt.zero_grad(set_to_none=True)
         gpu_sync(dev)
         loss.backward()
