@@ -6,6 +6,7 @@ dependencies = [
     "kaldi-native-fbank>=1.22.3",
     "loguru>=0.7.3",
     "numpy>=2.5.3",
+    "onnx>=1.23.2",
     "onnxruntime>=1.30.0",
     "scipy>=1.18.1",
     "soundfile>=0.14.0",

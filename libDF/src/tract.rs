@@ -230,6 +230,16 @@ pub struct DfTract {
     rolling_spec_buf_y: VecDeque<Tensor>, // Enhanced stage 1 spec buf
     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
     skip_counter: usize,  // Increment when wanting to skip processing due to low RMS
+    // Speaker conditioning of a personalized encoder (extra inputs `spk` and `sim`), fed
+    // with every frame; `None` for plain DeepFilterNet3.
+    cond: Option<Conditioning>,
+}
+
+/// Per-frame values of a personalized encoder's extra inputs.
+#[derive(Clone)]
+struct Conditioning {
+    spk: Tensor, // [n_ch, 1, spk_dim]: speaker fingerprint
+    sim: Tensor, // [n_ch, 1, sim_dim]: "the speaker talks" cue
 }
 
 #[cfg(all(not(feature = "capi"), feature = "default-model"))]
@@ -251,6 +261,7 @@ impl DfTract {
         let ch = rp.n_ch;
 
         let enc = init_encoder_from_read(&mut Cursor::new(dfp.enc), df_cfg, ch)?;
+        let cond = conditioning_of(&enc, ch)?;
         let erb_dec = init_erb_decoder_from_read(
             &mut Cursor::new(dfp.erb_dec),
             model_cfg,
@@ -357,6 +368,7 @@ impl DfTract {
             post_filter: rp.post_filter,
             post_filter_beta: rp.post_filter_beta,
             skip_counter: 0,
+            cond,
         };
         m.init()?;
         #[cfg(feature = "timings")]
@@ -404,6 +416,48 @@ impl DfTract {
         self.erb_dec = SimpleState::new(self.erb_dec.plan())?;
         self.df_dec = SimpleState::new(self.df_dec.plan())?;
         self.init()
+    }
+
+    /// Whether the encoder takes a speaker fingerprint (personalized model).
+    pub fn is_conditioned(&self) -> bool {
+        self.cond.is_some()
+    }
+
+    /// Length of the speaker fingerprint a personalized encoder expects.
+    pub fn speaker_dim(&self) -> Option<usize> {
+        self.cond.as_ref().map(|c| c.spk.shape()[2])
+    }
+
+    /// Speaker fingerprint used from the next frame on (personalized model only).
+    pub fn set_speaker(&mut self, fingerprint: &[f32]) -> Result<()> {
+        let Some(c) = self.cond.as_mut() else {
+            bail!("this model takes no speaker fingerprint")
+        };
+        let mut view = c.spk.to_plain_array_view_mut::<f32>()?;
+        let dim = view.shape()[2];
+        if fingerprint.len() != dim {
+            bail!("fingerprint has {} values, the model expects {dim}", fingerprint.len());
+        }
+        for mut ch in view.outer_iter_mut() {
+            ch.iter_mut().zip(fingerprint).for_each(|(o, &v)| *o = v);
+        }
+        Ok(())
+    }
+
+    /// "The speaker talks" cue used from the next frame on (personalized model only).
+    pub fn set_sim(&mut self, cue: &[f32]) -> Result<()> {
+        let Some(c) = self.cond.as_mut() else {
+            bail!("this model takes no similarity cue")
+        };
+        let mut view = c.sim.to_plain_array_view_mut::<f32>()?;
+        let dim = view.shape()[2];
+        if cue.len() != dim {
+            bail!("cue has {} values, the model expects {dim}", cue.len());
+        }
+        for mut ch in view.outer_iter_mut() {
+            ch.iter_mut().zip(cue).for_each(|(o, &v)| *o = v);
+        }
+        Ok(())
     }
 
     pub fn init(&mut self) -> Result<()> {
@@ -467,10 +521,15 @@ impl DfTract {
             );
         }
         // Run encoder
-        let mut enc_emb = self.enc.run(tvec!(
+        let mut enc_in = tvec!(
             TValue::from(self.erb_buf.clone()),
             TValue::from(self.cplx_buf.clone().permute_axes(&[0, 3, 1, 2])?)
-        ))?;
+        );
+        if let Some(c) = &self.cond {
+            enc_in.push(TValue::from(c.spk.clone()));
+            enc_in.push(TValue::from(c.sim.clone()));
+        }
+        let mut enc_emb = self.enc.run(enc_in)?;
 
         let lsnr_value = enc_emb.pop().unwrap();
         let lsnr = *lsnr_value.try_as_plain_ram()?.to_scalar::<f32>()?;
@@ -798,10 +857,21 @@ fn init_encoder_impl(
         feat_erb.shape,
         feat_spec.shape,
     );
-    m = m
-        .with_input_fact(0, feat_erb)?
-        .with_input_fact(1, feat_spec)?
-        .with_input_names(["feat_erb", "feat_spec"])?;
+    m = m.with_input_fact(0, feat_erb)?.with_input_fact(1, feat_spec)?;
+    match m.input_outlets()?.len() {
+        2 => m = m.with_input_names(["feat_erb", "feat_spec"])?,
+        // Personalized encoder: speaker fingerprint and cue, one value per frame.
+        4 => {
+            let spk_dim = last_dim(&m, 2)?;
+            let sim_dim = last_dim(&m, 3)?;
+            log::debug!("Encoder conditioning: spk [{spk_dim}], sim [{sim_dim}]");
+            m = m
+                .with_input_fact(2, InferenceFact::dt_shape(f32::datum_type(), shapefactoid!(n_ch, s, spk_dim)))?
+                .with_input_fact(3, InferenceFact::dt_shape(f32::datum_type(), shapefactoid!(n_ch, s, sim_dim)))?
+                .with_input_names(["feat_erb", "feat_spec", "spk", "sim"])?;
+        }
+        n => bail!("encoder with {n} inputs is not supported"),
+    }
     select_output_names(&mut m, &["e0", "e1", "e2", "e3", "emb", "c0", "lsnr"])?;
 
     m.analyse(true)?;
@@ -812,6 +882,36 @@ fn init_encoder_impl(
     log::info!("Init encoder");
     let m = pulsed.into_typed()?.into_optimized()?;
     Ok(m)
+}
+
+/// Fixed size of the last axis of an ONNX input (`spk`/`sim` of a personalized encoder).
+fn last_dim(m: &InferenceModel, input: usize) -> Result<usize> {
+    use tract_core::internal::DimLike;
+    use tract_onnx::tract_hir::infer::Factoid;
+    let fact = m.input_fact(input)?;
+    let rank = fact.shape.rank().concretize().context("input of unknown rank")? as usize;
+    let dim: TDim = fact
+        .shape
+        .dim(rank - 1)
+        .and_then(|d| d.concretize())
+        .context("input with a dynamic last axis")?;
+    Ok(dim.to_usize()?)
+}
+
+/// Zeroed per-frame tensors for the extra inputs of a personalized encoder.
+fn conditioning_of(enc: &TypedModel, n_ch: usize) -> Result<Option<Conditioning>> {
+    use tract_core::internal::DimLike;
+    if enc.inputs.len() == 2 {
+        return Ok(None);
+    }
+    let dim = |i: usize| -> Result<usize> {
+        let shape = &enc.input_fact(i)?.shape;
+        Ok(shape[shape.len() - 1].to_usize()?)
+    };
+    Ok(Some(Conditioning {
+        spk: Tensor::zero::<f32>(&[n_ch, 1, dim(2)?])?,
+        sim: Tensor::zero::<f32>(&[n_ch, 1, dim(3)?])?,
+    }))
 }
 fn init_encoder(m: &Path, df_cfg: &ini::Properties, n_ch: usize) -> Result<TypedModel> {
     let m = tract_onnx::onnx().with_ignore_output_shapes(true).model_for_path(m)?;

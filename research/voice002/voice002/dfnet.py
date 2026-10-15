@@ -184,23 +184,29 @@ class SpeakerCondition(nn.Module):
         self.proj_sim = _zero_linear(SIM_DIM, self.in_dim + self.film_dim) if use_sim else None
         self.spk: Tensor | None = None
         self.sim: Tensor | None = None
+        self.sim_per_frame = False
 
     def projection_parameters(self) -> list[nn.Parameter]:
         mods = [m for m in (self.proj, self.proj_in, self.proj_sim) if m is not None]
         return [p for m in mods for p in m.parameters()]
 
     def _cues(self, t: int) -> tuple[Tensor | None, Tensor | None]:
-        """Additive input term [B, 1|T, in] and FiLM term [B, 1|T, 2*out]."""
+        """Additive input term [B, 1|T, in] and FiLM term [B, 1|T, 2*out].
+
+        `spk` is [B, 192] or already per frame [B, T, 192]; `sim` is per 200 ms hop
+        [B, H, 2], or per frame [B, T, 2] when `sim_per_frame` is set (ONNX export: the
+        streaming runtime feeds both inputs frame by frame)."""
         c_in = c_film = None
+        spk = self.spk if self.spk.dim() == 3 else self.spk[:, None, :]
         if self.mode == "enc":
-            c_in = self.proj(self.spk)[:, None, :]
+            c_in = self.proj(spk)
         elif self.mode == "film":
-            c_film = self.proj(self.spk)[:, None, :]
+            c_film = self.proj(spk)
         else:
-            c_in = self.proj_in(self.spk)[:, None, :]
-            c_film = self.proj(self.spk)[:, None, :]
+            c_in = self.proj_in(spk)
+            c_film = self.proj(spk)
         if self.proj_sim is not None:
-            s = self.proj_sim(frames_from_hops(self.sim, t))
+            s = self.proj_sim(self.sim if self.sim_per_frame else frames_from_hops(self.sim, t))
             if c_in is not None:
                 c_in = c_in + s[..., : self.in_dim]
             if c_film is not None:
@@ -261,6 +267,22 @@ def _replace_convt(module: nn.Module) -> None:
             setattr(module, name, DepthwiseConvT(child))
         else:
             _replace_convt(child)
+
+
+def restore_convt(module: nn.Module) -> None:
+    """Undo `_replace_convt` with the trained weights, for ONNX export: the zero insertion
+    exports as ScatterND, which tract cannot stream frame by frame."""
+    for name, child in module.named_children():
+        if isinstance(child, DepthwiseConvT):
+            c, _, _, k = child.weight.shape
+            convt = nn.ConvTranspose2d(
+                c, c, (1, k), stride=(1, child.stride), padding=(0, child.pad),
+                output_padding=(0, child.out_pad), groups=c, bias=False,
+            )
+            convt.weight = child.weight
+            setattr(module, name, convt)
+        else:
+            restore_convt(child)
 
 
 class PersonalDfNet(nn.Module):

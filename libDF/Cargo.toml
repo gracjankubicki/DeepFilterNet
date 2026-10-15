@@ -39,6 +39,11 @@ name = "resample_regression"
 path = "tests/resample_regression.rs"
 required-features = ["transforms"]
 
+[[test]]
+name = "personal_parity"
+path = "tests/personal_parity.rs"
+required-features = ["tract", "default-model"]
+
 [features]
 default = ["default-model", "vorbis", "flac"]
 

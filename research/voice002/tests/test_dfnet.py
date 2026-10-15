@@ -12,8 +12,23 @@ from voice002.dfnet import (
     erb_widths,
     frames_from_hops,
     norm_alpha,
+    restore_convt,
 )
 from voice002.train import MultiResSpecLoss, load_init
+
+
+def test_restored_convtranspose_equals_the_training_replacement():
+    torch.manual_seed(0)
+    model = PersonalDfNet("both-sim").eval()
+    for p in model.net.erb_dec.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    inputs = (torch.randn(1, 20, 512), *(torch.randn(1, 64, 20, f) for f in (8, 8, 16, 32)))
+    with torch.no_grad():
+        before = model.net.erb_dec(*inputs)
+        restore_convt(model.net)
+        after = model.net.erb_dec(*inputs)
+    assert not any("DepthwiseConvT" in type(m).__name__ for m in model.net.modules())
+    assert torch.allclose(before, after, atol=1e-5)
 
 
 def test_erb_widths_cover_all_bins():
